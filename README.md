@@ -115,8 +115,15 @@ SubtitleGenerator/
 │   ├── vlc-extension/              # VLC Lua tests (lupa) + PowerShell backend tests
 │   ├── run_all.py                  # Runs all tests (Python + PowerShell)
 │   └── README.md
+├── AGENTS.md                      # Instructions for coding agents / contributors
 └── README.md                      # This file
 ```
+
+## Contributing / Coding Agents
+
+See [AGENTS.md](AGENTS.md) for repo conventions — most importantly, the
+subtitle pipeline is duplicated in the Python CLI and the PowerShell backend and
+**changes must be mirrored in both**, with tests run via `python tests/run_all.py`.
 
 ## Tests
 
