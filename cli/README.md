@@ -1,6 +1,6 @@
 # Python CLI Tool - Subtitle Generator
 
-A standalone command-line interface for generating subtitles without VLC. Requires Python 3.6+ (no external packages needed).
+A standalone command-line interface for generating subtitles without VLC. Requires Python 3.8+ (no external packages needed).
 
 ## Usage
 
@@ -13,7 +13,15 @@ python subtitle_cli.py "video.mp4" --segment-size 120 -o "C:\Subtitles\output.sr
 # Interactive mode (arrow-key menus for all options)
 python subtitle_cli.py --interactive
 python subtitle_cli.py -i
+
+# Equivalent module form (same arguments)
+python -m subtitle_generator "video.mp4"
 ```
+
+> **Layout:** `subtitle_cli.py` is a thin backward-compatible shim. The
+> implementation lives in the stdlib-only `subtitle_generator/` package, split
+> into core logic (`config`, `srt`, `transcribe`) and UI/usage
+> (`cli`, `interactive`, `progress`). No external packages are required.
 
 ## Options
 
@@ -44,8 +52,8 @@ python subtitle_cli.py -i
 1. Loads defaults from config file (`%APPDATA%\subtitle_generator\config.txt`)
 2. Extracts audio from the video using ffmpeg → 16kHz mono WAV
 3. Calculates exact duration from WAV file size
-4. Splits processing into segments and runs whisper-cli.exe on each
-5. Merges segment SRT outputs into a single subtitle file
+4. Splits processing into overlapping segments and runs whisper-cli.exe on each (overlap gives whisper cross-boundary context so words at segment edges are transcribed correctly)
+5. Merges segment SRT outputs, committing only captions inside each segment's owned window, then cleans up the result (collapses repeated captions, removes overlaps, and clamps over-long "stuck" captions)
 6. Prints the output SRT path to stdout
 
 ## Generated Files (Debugging)

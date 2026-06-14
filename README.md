@@ -1,6 +1,6 @@
 # Subtitle Generator
 
-**Version: 0.2.1**
+**Version: 2.0.0**
 
 Generate subtitles for any video using **whisper.cpp** (local speech-to-text). Works entirely offline — no internet or API keys required.
 
@@ -11,6 +11,7 @@ Generate subtitles for any video using **whisper.cpp** (local speech-to-text). W
 - Progress tracking with real-time updates
 - Configurable segment size (default: 120s balanced)
 - Handles special characters in file paths (parentheses, spaces, unicode)
+- Accurate segment boundaries via overlap context, with automatic cleanup of repeated, overlapping, and over-long "stuck" captions
 - Your video files are never modified — only a new `.srt` file is created
 
 ## How It Works
@@ -48,13 +49,13 @@ This project provides two ways to generate subtitles:
 | Component | Description | Documentation |
 |-----------|-------------|---------------|
 | **[VLC Extension](vlc-extension/README.md)** | GUI integrated into VLC's View menu. Full File mode, Live mode, auto-reload. Includes PowerShell/batch backend scripts. | [vlc-extension/README.md](vlc-extension/README.md) |
-| **[Python CLI](cli/README.md)** | Standalone command-line tool. Python 3.6+, no external packages. | [cli/README.md](cli/README.md) |
+| **[Python CLI](cli/README.md)** | Standalone command-line tool. Python 3.8+, no external packages. | [cli/README.md](cli/README.md) |
 
 ### Quick Start — VLC Extension
 
 ```powershell
-# Install
-Copy-Item "vlc-extension\subtitle_generator.lua" "$env:APPDATA\vlc\lua\extensions\"
+# Install — copy all three Lua files (entry + core + UI) into the extensions folder
+Copy-Item "vlc-extension\*.lua" "$env:APPDATA\vlc\lua\extensions\"
 New-Item -ItemType Directory -Path "$env:APPDATA\vlc\lua\extensions\scripts" -Force
 Copy-Item "vlc-extension\generate_subtitles.*" "$env:APPDATA\vlc\lua\extensions\scripts\"
 # Restart VLC → View → Subtitle Generator → Settings → configure paths → Generate
@@ -89,15 +90,43 @@ python cli/subtitle_cli.py "video.mp4" --language es --translate
 ```
 SubtitleGenerator/
 ├── cli/
-│   ├── subtitle_cli.py             # Python CLI tool (standalone)
+│   ├── subtitle_cli.py             # Backward-compatible entry point (thin shim)
+│   ├── subtitle_generator/         # Python package
+│   │   ├── __init__.py             # Version
+│   │   ├── config.py               # Core: load/save configuration
+│   │   ├── srt.py                  # Core: SRT parse/write + caption cleanup
+│   │   ├── transcribe.py           # Core: ffmpeg + whisper + segmentation pipeline
+│   │   ├── logging_.py             # File logger
+│   │   ├── progress.py             # UI: terminal progress bar
+│   │   ├── languages.py            # Supported language table
+│   │   ├── interactive.py          # UI: arrow-key menus and prompts
+│   │   ├── cli.py                  # Usage: argparse + main() entry point
+│   │   └── __main__.py             # Enables `python -m subtitle_generator`
 │   └── README.md
 ├── vlc-extension/
-│   ├── subtitle_generator.lua      # VLC Lua extension (UI + control logic)
+│   ├── subtitle_generator.lua      # Entry: VLC lifecycle hooks (loads modules below)
+│   ├── sg_core.lua                 # Core logic (config, paths, media, process control)
+│   ├── sg_ui.lua                   # UI (dialogs and widget handling)
 │   ├── generate_subtitles.ps1      # Main processing script (ffmpeg + whisper)
 │   ├── generate_subtitles.bat      # Batch wrapper for VLC to launch PowerShell
 │   └── README.md
+├── tests/                          # test suite (run: python tests/run_all.py)
+│   ├── cli/                        # CLI package tests (srt, transcribe, config, cli)
+│   ├── vlc-extension/              # VLC Lua tests (lupa) + PowerShell backend tests
+│   ├── run_all.py                  # Runs all tests (Python + PowerShell)
+│   └── README.md
 └── README.md                      # This file
 ```
+
+## Tests
+
+Run the full suite (CLI Python tests + VLC Lua and PowerShell backend tests) from the repo root:
+
+```powershell
+python tests/run_all.py
+```
+
+Tests are grouped by component under `tests/cli/` and `tests/vlc-extension/`. The Lua tests are optional (run only if [`lupa`](https://pypi.org/project/lupa/) is installed) and the PowerShell backend tests run via `pwsh`/`powershell`; both are skipped automatically when unavailable. See [tests/README.md](tests/README.md).
 
 ## License
 

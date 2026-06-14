@@ -27,6 +27,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Tuning for boundary handling and hallucination cleanup
+$script:SegmentOverlapSeconds = 3.0   # context padding extracted around each segment
+$script:MaxCaptionSeconds = 10.0      # hard cap so a stuck/hallucinated caption can't linger
+$script:MinCaptionSeconds = 0.2
+$script:DuplicateGapSeconds = 0.5     # consecutive identical text within this gap = repetition
+
 # Status file for progress reporting
 $StatusFile = $OutputSrt -replace '\.srt$', '.status'
 $LogFile = $OutputSrt -replace '\.srt$', '.log'
@@ -110,6 +116,7 @@ function Invoke-Whisper {
         "-m", $ModelPath,
         "-f", $AudioPath,
         "-l", $Language,
+        "--max-context", "0",
         "--output-srt",
         "--output-file", $OutputBase
     )
@@ -174,6 +181,95 @@ function Offset-SrtTimestamp {
     param([string]$Timestamp, [double]$OffsetSeconds)
     $totalSeconds = (Parse-SrtTimestamp $Timestamp) + $OffsetSeconds
     return Convert-ToSrtTimestamp $totalSeconds
+}
+
+function Select-OwnedEntries {
+    param(
+        [array]$Entries,
+        [double]$ClipStart,
+        [double]$OwnedStart,
+        [double]$OwnedEnd
+    )
+    # Commit only captions whose absolute start falls in this segment's owned
+    # window [OwnedStart, OwnedEnd). The overlap regions are context-only and are
+    # owned by the adjacent segment, so boundary captions aren't duplicated.
+    # Entry timestamps are clip-relative; they are shifted to absolute time here.
+    $result = @()
+    foreach ($entry in $Entries) {
+        $absStart = (Parse-SrtTimestamp $entry.Start) + $ClipStart
+        if ($absStart -ge ($OwnedStart - 0.001) -and $absStart -lt $OwnedEnd) {
+            $result += @{
+                Start = (Offset-SrtTimestamp -Timestamp $entry.Start -OffsetSeconds $ClipStart)
+                End   = (Offset-SrtTimestamp -Timestamp $entry.End -OffsetSeconds $ClipStart)
+                Text  = $entry.Text
+            }
+        }
+    }
+    return $result
+}
+
+function Postprocess-Entries {
+    param([array]$Entries)
+    # Fixes the two common whisper artifacts:
+    #  - Repetition loops (same caption repeated on silence/music) -> drop duplicates
+    #  - Overlapping captions -> trim previous caption end to next caption start
+    #  - Over-long ("stuck") captions -> clamp to MaxCaptionSeconds
+    $items = @()
+    foreach ($e in $Entries) {
+        $text = $e.Text.Trim()
+        if ($text -eq "") { continue }
+        $items += [PSCustomObject]@{
+            Start = (Parse-SrtTimestamp $e.Start)
+            End   = (Parse-SrtTimestamp $e.End)
+            Text  = $text
+        }
+    }
+    if ($items.Count -eq 0) { return @() }
+    $items = @($items | Sort-Object Start, End)
+
+    $cleaned = New-Object System.Collections.ArrayList
+    foreach ($it in $items) {
+        if ($it.End -le $it.Start) { $it.End = $it.Start + $script:MinCaptionSeconds }
+        if ($cleaned.Count -gt 0) {
+            $prev = $cleaned[$cleaned.Count - 1]
+            # Merge a contiguous run of identical captions (repetition loop on
+            # silence/music) into a single caption by extending the previous end.
+            if ($it.Text -eq $prev.Text -and $it.Start -le ($prev.End + $script:DuplicateGapSeconds)) {
+                $prev.End = [Math]::Max($prev.End, $it.End)
+                continue
+            }
+            # No overlapping captions: trim the previous one to this start
+            if ($prev.End -gt $it.Start) { $prev.End = $it.Start }
+        }
+        [void]$cleaned.Add($it)
+    }
+
+    # Clamp over-long captions (stuck subtitle / hallucinated span)
+    foreach ($it in $cleaned) {
+        if (($it.End - $it.Start) -gt $script:MaxCaptionSeconds) {
+            $it.End = $it.Start + $script:MaxCaptionSeconds
+        }
+    }
+
+    # Final ordering/overlap safety pass
+    for ($i = 0; $i -lt ($cleaned.Count - 1); $i++) {
+        if ($cleaned[$i].End -gt $cleaned[$i + 1].Start) {
+            $cleaned[$i].End = $cleaned[$i + 1].Start
+        }
+        if ($cleaned[$i].End -le $cleaned[$i].Start) {
+            $cleaned[$i].End = $cleaned[$i].Start + 0.05
+        }
+    }
+
+    $result = @()
+    foreach ($it in $cleaned) {
+        $result += @{
+            Start = (Convert-ToSrtTimestamp $it.Start)
+            End   = (Convert-ToSrtTimestamp $it.End)
+            Text  = $it.Text
+        }
+    }
+    return $result
 }
 
 function Write-SrtFile {
@@ -292,6 +388,7 @@ try {
                 "-m", $ModelPath,
                 "-f", $audioPath,
                 "-l", $Language,
+                "--max-context", "0",
                 "--output-srt",
                 "--output-file", $outputBase
             )
@@ -313,6 +410,7 @@ try {
             $whisperSrt = "$outputBase.srt"
             if (Test-Path $whisperSrt) {
                 $entries = Parse-SrtFile -Path $whisperSrt
+                $entries = Postprocess-Entries -Entries $entries
                 Write-SrtFile -Path $OutputSrt -Entries $entries
             } else {
                 throw "whisper.cpp did not produce output SRT file"
@@ -330,13 +428,18 @@ try {
 
                 Write-Status -Status "running" -Progress $progress.ToString()
 
+                # Extract with overlap padding so whisper has cross-boundary context
+                $clipStart = [Math]::Max(0, $offset - $script:SegmentOverlapSeconds)
+                $clipEnd = [Math]::Min($duration, $offset + $segDuration + $script:SegmentOverlapSeconds)
+                $clipDuration = $clipEnd - $clipStart
+
                 # Extract audio segment
                 $segAudio = Join-Path $tempDir "seg_$currentSegment.wav"
-                $startStr = [TimeSpan]::FromSeconds($offset).ToString("hh\:mm\:ss\.fff")
+                $startStr = [TimeSpan]::FromSeconds($clipStart).ToString("hh\:mm\:ss\.fff")
                 $ffmpegSegArgs = @(
                     "-y", "-hide_banner", "-loglevel", "error",
                     "-ss", $startStr,
-                    "-t", $segDuration.ToString(),
+                    "-t", $clipDuration.ToString(),
                     "-i", $audioPath,
                     "-ar", "16000",
                     "-ac", "1",
@@ -355,6 +458,7 @@ try {
                     "-m", $ModelPath,
                     "-f", $segAudio,
                     "-l", $Language,
+                    "--max-context", "0",
                     "--output-srt",
                     "--output-file", $segOutputBase
                 )
@@ -371,17 +475,15 @@ try {
                     continue
                 }
 
-                # Parse and offset timestamps
+                # Parse and offset timestamps; commit only captions whose start
+                # falls in this segment's owned window so overlap regions (which are
+                # context-only) don't produce duplicated boundary captions.
                 $segSrt = "$segOutputBase.srt"
                 if (Test-Path $segSrt) {
                     $segEntries = Parse-SrtFile -Path $segSrt
-                    foreach ($entry in $segEntries) {
-                        $allEntries += @{
-                            Start = (Offset-SrtTimestamp -Timestamp $entry.Start -OffsetSeconds $offset)
-                            End = (Offset-SrtTimestamp -Timestamp $entry.End -OffsetSeconds $offset)
-                            Text = $entry.Text
-                        }
-                    }
+                    $ownedStart = if ($currentSegment -eq 1) { 0 } else { $offset }
+                    $ownedEnd = if (($offset + $segmentSize) -ge $duration) { [double]::PositiveInfinity } else { $offset + $segDuration }
+                    $allEntries += @(Select-OwnedEntries -Entries $segEntries -ClipStart $clipStart -OwnedStart $ownedStart -OwnedEnd $ownedEnd)
                 }
 
                 # Clean up segment files
@@ -393,6 +495,7 @@ try {
 
             # Write final SRT
             if ($allEntries.Count -gt 0) {
+                $allEntries = Postprocess-Entries -Entries $allEntries
                 Write-SrtFile -Path $OutputSrt -Entries $allEntries
             } else {
                 throw "whisper.cpp did not produce any output"
@@ -418,9 +521,14 @@ try {
 
             Write-Status -Status "running" -Progress $progress.ToString()
 
+            # Extract with overlap padding so whisper has cross-boundary context
+            $clipStart = [Math]::Max(0, $offset - $script:SegmentOverlapSeconds)
+            $clipEnd = [Math]::Min($duration, $offset + $chunkDuration + $script:SegmentOverlapSeconds)
+            $clipDuration = $clipEnd - $clipStart
+
             # Extract audio chunk
             $chunkAudio = Join-Path $tempDir "chunk_$currentChunk.wav"
-            Extract-AudioChunk -InputPath $MediaPath -OutputPath $chunkAudio -StartTime $offset -Duration $chunkDuration
+            Extract-AudioChunk -InputPath $MediaPath -OutputPath $chunkAudio -StartTime $clipStart -Duration $clipDuration
 
             # Process with whisper
             $chunkOutputBase = Join-Path $tempDir "chunk_$currentChunk"
@@ -432,19 +540,17 @@ try {
                 continue
             }
 
-            # Parse chunk SRT and offset timestamps
+            # Parse chunk SRT and offset timestamps; commit only captions whose
+            # start falls in this chunk's owned window (overlap is context-only).
             $chunkSrt = "$chunkOutputBase.srt"
             if (Test-Path $chunkSrt) {
                 $chunkEntries = Parse-SrtFile -Path $chunkSrt
-                foreach ($entry in $chunkEntries) {
-                    $allEntries += @{
-                        Start = (Offset-SrtTimestamp -Timestamp $entry.Start -OffsetSeconds $offset)
-                        End = (Offset-SrtTimestamp -Timestamp $entry.End -OffsetSeconds $offset)
-                        Text = $entry.Text
-                    }
-                }
+                $ownedStart = if ($currentChunk -eq 1) { 0 } else { $offset }
+                $ownedEnd = if (($offset + $ChunkSize) -ge $duration) { [double]::PositiveInfinity } else { $offset + $chunkDuration }
+                $allEntries += @(Select-OwnedEntries -Entries $chunkEntries -ClipStart $clipStart -OwnedStart $ownedStart -OwnedEnd $ownedEnd)
                 # Write intermediate SRT (atomic)
-                Write-SrtFile -Path $OutputSrt -Entries $allEntries
+                $written = Postprocess-Entries -Entries $allEntries
+                Write-SrtFile -Path $OutputSrt -Entries $written
             }
 
             # Clean up chunk files to save space

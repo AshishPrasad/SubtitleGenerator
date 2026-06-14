@@ -7,11 +7,16 @@ The VLC Lua extension provides a graphical interface for generating subtitles di
 Run these commands in PowerShell:
 
 ```powershell
-# Install
-Copy-Item "vlc-extension\subtitle_generator.lua" "$env:APPDATA\vlc\lua\extensions\"
+# Install — copy all three Lua files (entry + core + UI) into the extensions folder
+Copy-Item "vlc-extension\*.lua" "$env:APPDATA\vlc\lua\extensions\"
 New-Item -ItemType Directory -Path "$env:APPDATA\vlc\lua\extensions\scripts" -Force
 Copy-Item "vlc-extension\generate_subtitles.*" "$env:APPDATA\vlc\lua\extensions\scripts\"
 ```
+
+> The extension is split into three files that must live side by side in
+> `%APPDATA%\vlc\lua\extensions\`: `subtitle_generator.lua` (entry/VLC hooks),
+> `sg_core.lua` (core logic), and `sg_ui.lua` (dialogs). Copying `*.lua` installs
+> all three.
 
 Then **restart VLC** for the extension to appear.
 
@@ -70,7 +75,9 @@ Then **restart VLC** for the extension to appear.
 ## Modes
 
 ### Full File Mode (Recommended)
-- Extracts all audio at once, processes in segments with progress tracking
+- Extracts all audio at once, processes in overlapping segments with progress tracking
+- Overlap gives whisper cross-boundary context, so words at segment edges are transcribed correctly
+- Output is cleaned up: repeated captions are collapsed, overlaps removed, and over-long "stuck" captions clamped
 - Progress updates after each segment completes
 - Most accurate results with configurable segment size
 - Best for: Videos, TV shows, recorded lectures
@@ -176,7 +183,7 @@ The `.log` file records every step with timestamps:
 - Check the `.status` file for current progress, or click **Check Status** in VLC
 
 ### Extension not appearing in VLC
-- Ensure `subtitle_generator.lua` is in `%APPDATA%\vlc\lua\extensions\`
+- Ensure `subtitle_generator.lua`, `sg_core.lua`, and `sg_ui.lua` are all in `%APPDATA%\vlc\lua\extensions\` (the entry file loads the other two at runtime)
 - Restart VLC completely (File → Quit, then reopen)
 - Check VLC messages (Tools → Messages) for Lua errors
 
